@@ -1,0 +1,11 @@
+{
+  "name": "public-goods-host",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "公共財ゲーム（ホスト側）",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "test:e2e": "node tests/e2e.cjs"
+  }
+}

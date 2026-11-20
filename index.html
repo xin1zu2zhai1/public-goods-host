@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>公共財ゲーム ホスト</title>
+  <meta name="description" content="授業用の公共財ゲーム（ホスト・教員用画面）">
+  <meta name="robots" content="noindex">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%231d64d8'/%3E%3Ctext x='32' y='43' font-size='30' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='700'%3E%C2%A5%3C/text%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=BIZ+UDPGothic:wght@400;700&display=swap">
+  <link rel="stylesheet" href="css/host.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">公共財ゲーム<small>ホスト</small></div>
+    <span class="top-code" id="topCode"></span>
+    <span class="spacer"></span>
+    <span class="net" id="netStatus" data-s="connecting" role="status">準備中…</span>
+    <button class="btn small" id="btnProjector" type="button" aria-pressed="false">投影モード</button>
+  </header>
+
+  <main class="layout">
+    <div class="col">
+      <section class="card join" aria-labelledby="joinTitle">
+        <h2 id="joinTitle">参加方法</h2>
+        <p class="note">スマホのカメラでQRコードを読み取るか、参加ページでコードを入力</p>
+        <div class="qr" id="qr" role="button" tabindex="0" aria-label="QRコードを大きく表示"></div>
+        <div class="code-label">ルームコード</div>
+        <div class="code" id="roomCode">------</div>
+        <div class="join-url" id="joinUrl"></div>
+        <div class="row">
+          <button class="btn small" id="btnQrBig" type="button">大きく表示</button>
+          <button class="btn small host-only" id="btnCopy" type="button">URLをコピー</button>
+        </div>
+        <div class="headcount">
+          <b id="playerCount">0</b> 人が参加
+          <div class="note" id="onlineCount"></div>
+        </div>
+      </section>
+
+      <section class="card host-only" aria-labelledby="dataTitle">
+        <h2 id="dataTitle">データ</h2>
+        <p class="note">結果はこのブラウザに自動保存されます。再読み込みしても続きから再開できます。</p>
+        <div class="actions">
+          <button class="btn small" id="btnCsv" type="button">結果をCSVで保存</button>
+          <button class="btn small danger" id="btnNewRoom" type="button">新しいルームを作る</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="col">
+      <section class="card" aria-labelledby="roundTitle">
+        <div class="phase-line">
+          <span class="badge" id="phaseBadge">準備中</span>
+          <h1 class="round-title" id="roundTitle">参加者を待っています</h1>
+          <span class="badge" id="stageBadge" hidden></span>
+        </div>
+        <div class="rule-box" id="ruleBox">
+          <span class="label">罰則ルール</span>
+          <label class="switch">
+            <input type="checkbox" id="punishToggle">
+            <span class="track" aria-hidden="true"></span>
+            <span id="punishLabel">なし</span>
+          </label>
+          <span class="note" id="punishNote"></span>
+        </div>
+        <div id="progressBox"></div>
+        <div class="actions" id="actions"></div>
+        <div id="alerts"></div>
+      </section>
+
+      <section class="card" aria-labelledby="chartTitle">
+        <div class="card-head">
+          <h2 id="chartTitle">拠出額の推移</h2>
+          <span class="spacer"></span>
+          <span class="note" id="chartNote"></span>
+        </div>
+        <div id="chartContrib"></div>
+        <div id="stageStats"></div>
+      </section>
+
+      <section class="card" aria-labelledby="histTitle" id="histCard" hidden>
+        <div class="card-head">
+          <h2 id="histTitle">最新ラウンドの拠出額の分布</h2>
+        </div>
+        <div id="hist"></div>
+      </section>
+
+      <section class="card" aria-labelledby="groupsTitle">
+        <div class="card-head">
+          <h2 id="groupsTitle">グループ</h2>
+          <span class="note" id="groupsNote"></span>
+          <span class="spacer"></span>
+          <span class="field check host-only"><label><input type="checkbox" id="hostShowNames"> 名前を表示</label></span>
+          <button class="btn small host-only" id="btnRegroup" type="button">グループを組み直す</button>
+        </div>
+        <div class="groups" id="groups"></div>
+        <div class="waiting-list" id="waitingList"></div>
+      </section>
+
+      <section class="card" aria-labelledby="tableTitle">
+        <div class="card-head"><h2 id="tableTitle">ラウンドごとの結果</h2></div>
+        <div class="table-wrap" id="roundTable"></div>
+      </section>
+
+      <section class="card" aria-labelledby="reflTitle">
+        <div class="card-head">
+          <h2 id="reflTitle">振り返り</h2>
+          <span class="spacer"></span>
+          <label class="switch host-only">
+            <input type="checkbox" id="commentToggle">
+            <span class="track" aria-hidden="true"></span>
+            <span>匿名コメントを受け付ける</span>
+          </label>
+        </div>
+        <ol class="questions">
+          <li><span class="q-tag">個人の心理</span>なぜあの時、自分は拠出額を減らした（または増やした）のか？</li>
+          <li><span class="q-tag">ルールの効果</span>罰則や話し合いによって、グループの雰囲気はどう変わったか？</li>
+          <li><span class="q-tag">社会との接続</span>このゲームの状況は、現実のどんな問題（ゴミ問題、気候変動など）に近いか？</li>
+          <li><span class="q-tag">未来への提言</span>私たちがより協力しやすい社会を作るために、どんな工夫が必要だと思うか？</li>
+        </ol>
+        <details class="extra-q">
+          <summary>深める問い</summary>
+          <ul>
+            <li><b>経済的視点</b>：もし増殖係数が1.1倍だったら、あなたの行動は変わりましたか？</li>
+            <li><b>倫理的視点</b>：他者を犠牲にして自分だけが利益を得ることは、このゲームにおいて「成功」と言えるでしょうか？</li>
+            <li><b>政治的視点</b>：特定のリーダーが拠出額を強制するルールと、自分たちで話し合うルール、どちらが納得感がありますか？</li>
+            <li><b>心理的視点</b>：誰がいくら出したか公表されたとき、最も気になったことは何ですか？</li>
+          </ul>
+        </details>
+        <div class="comments" id="comments"></div>
+      </section>
+
+      <details class="card host-only" id="settingsCard">
+        <summary>ゲームの設定</summary>
+        <form class="form" id="settingsForm" autocomplete="off" onsubmit="return false">
+          <div class="field">
+            <label for="sEndowment">初期保有額（円）</label>
+            <input type="number" id="sEndowment" name="endowment" min="100" step="100" inputmode="numeric">
+          </div>
+          <div class="field">
+            <label for="sMultiplier">増殖係数（倍）</label>
+            <input type="number" id="sMultiplier" name="multiplier" min="1" max="10" step="0.1" inputmode="decimal">
+          </div>
+          <div class="field">
+            <label for="sGroupSize">1グループの人数</label>
+            <select id="sGroupSize" name="groupSize">
+              <option value="2">2人</option>
+              <option value="3">3人</option>
+              <option value="4">4人</option>
+              <option value="5">5人</option>
+              <option value="6">6人</option>
+              <option value="8">8人</option>
+              <option value="10">10人</option>
+              <option value="0">全員で1グループ</option>
+            </select>
+          </div>
+          <div class="form-section">罰則ルール</div>
+          <div class="field">
+            <label for="sPunishCost">罰1回の費用（円）</label>
+            <input type="number" id="sPunishCost" name="punishCost" min="0" step="10" inputmode="numeric">
+          </div>
+          <div class="field">
+            <label for="sPunishEffect">罰1回で相手から減る額（円）</label>
+            <input type="number" id="sPunishEffect" name="punishEffect" min="0" step="10" inputmode="numeric">
+          </div>
+          <div class="field">
+            <label for="sPunishMax">1人に与えられる罰の最大回数</label>
+            <input type="number" id="sPunishMax" name="punishMax" min="1" max="20" step="1" inputmode="numeric">
+          </div>
+          <div class="form-section">進行</div>
+          <div class="field check"><label><input type="checkbox" name="showNames"> グループ内でニックネームを見せる（オフ＝A・B・C…の匿名）</label></div>
+          <div class="field check"><label><input type="checkbox" name="autoAdvance"> 全員が入力したら自動で締め切る</label></div>
+          <div class="field check"><label><input type="checkbox" name="acceptJoin"> 新しい参加を受け付ける</label></div>
+          <div class="form-section">詳細</div>
+          <div class="field wide">
+            <label for="sPlayerUrl">参加者用ページのURL（QRコードに入ります）</label>
+            <input type="url" id="sPlayerUrl" name="playerUrl" spellcheck="false">
+          </div>
+          <p class="note field wide" id="settingsNote"></p>
+        </form>
+      </details>
+    </div>
+  </main>
+
+  <div class="overlay" id="qrOverlay" hidden>
+    <div class="overlay-card">
+      <div class="big-join">
+        <div class="qr" id="qrBig" role="button" tabindex="0" aria-label="閉じる"></div>
+        <div>
+          <div class="code-label">ルームコード</div>
+          <div class="code" id="roomCodeBig"></div>
+          <div class="join-url" id="joinUrlBig"></div>
+          <div class="headcount"><b id="playerCountBig">0</b> 人が参加</div>
+        </div>
+      </div>
+      <div class="modal-actions"><button class="btn" id="btnQrClose" type="button">閉じる</button></div>
+    </div>
+  </div>
+
+  <div class="overlay" id="modal" hidden>
+    <div class="overlay-card" style="max-width:520px">
+      <h2 id="modalTitle"></h2>
+      <p id="modalBody"></p>
+      <div class="modal-actions" id="modalActions"></div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden role="status"></div>
+
+  <noscript>このページを使うには JavaScript を有効にしてください。</noscript>
+  <script src="vendor/peerjs.min.js"></script>
+  <script src="vendor/qrcode.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
