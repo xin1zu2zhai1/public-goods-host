@@ -13,9 +13,12 @@ export const DEFAULT_PLAYER_URL = 'https://xin1zu2zhai1.github.io/public-goods-g
  * URL に ?relay=wss://…,wss://… を付けると差し替えられる（QRコードにも引き継がれる）。
  */
 export const RELAY_BROKERS = [
+  // 443番（普通のWebサイトと同じポート）。学校や職場のネットワークでも通りやすい
+  'wss://public:public@public.cloud.shiftr.io:443',
+  'wss://mqtt.eclipseprojects.io:443/mqtt',
+  // 443番以外。スマホ回線などでは通ることが多い
   'wss://broker.emqx.io:8084/mqtt',
   'wss://broker.hivemq.com:8884/mqtt',
-  'wss://mqtt.eclipseprojects.io:443/mqtt',
   'wss://test.mosquitto.org:8081/mqtt',
 ];
 

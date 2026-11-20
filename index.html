@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <script>
     // 新しい版が公開されていたら、古いファイルを使わないように読み込み直す
-    window.APP_VERSION = '1.5.0';
+    window.APP_VERSION = '1.6.0';
     (function () {
       try {
         fetch('version.json?t=' + Date.now(), { cache: 'no-store' })
@@ -32,7 +32,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=BIZ+UDPGothic:wght@400;700&display=swap">
-  <link rel="stylesheet" href="css/host.css?v=1.5.0">
+  <link rel="stylesheet" href="css/host.css?v=1.6.0">
 </head>
 <body>
   <header class="topbar">
@@ -236,9 +236,9 @@
   <footer class="ver">版 <span id="appVersion"></span></footer>
   <script>document.getElementById('appVersion').textContent = window.APP_VERSION;</script>
   <noscript>このページを使うには JavaScript を有効にしてください。</noscript>
-  <script src="vendor/peerjs.min.js?v=1.5.0"></script>
-  <script src="vendor/mqtt.min.js?v=1.5.0"></script>
-  <script src="vendor/qrcode.js?v=1.5.0"></script>
-  <script type="module" src="js/app.js?v=1.5.0"></script>
+  <script src="vendor/peerjs.min.js?v=1.6.0"></script>
+  <script src="vendor/mqtt.min.js?v=1.6.0"></script>
+  <script src="vendor/qrcode.js?v=1.6.0"></script>
+  <script type="module" src="js/app.js?v=1.6.0"></script>
 </body>
 </html>

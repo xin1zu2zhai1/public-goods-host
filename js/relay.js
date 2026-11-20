@@ -99,11 +99,27 @@ export function brokerLabel(url) {
 }
 
 function connectBroker(url, opts) {
-  return mqtt.connect(url, {
+  // URL に「ユーザー名:パスワード@」が入っていれば、接続の設定として渡す（例：shiftr.io の public:public）
+  let target = url;
+  const auth = {};
+  try {
+    const u = new URL(url);
+    if (u.username) {
+      auth.username = decodeURIComponent(u.username);
+      auth.password = decodeURIComponent(u.password);
+      u.username = '';
+      u.password = '';
+      target = u.toString();
+    }
+  } catch {
+    /* そのまま使う */
+  }
+  return mqtt.connect(target, {
     protocolVersion: 4,
     clean: true,
     connectTimeout: 10000,
     keepalive: 30,
+    ...auth,
     ...opts,
   });
 }

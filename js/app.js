@@ -1,9 +1,9 @@
-import * as G from './game.js?v=1.5.0';
-import { HostNet } from './net-host.js?v=1.5.0';
-import { RelayHost, SignalHost } from './relay.js?v=1.5.0';
-import { PEER_ID_PREFIX, DEFAULT_PLAYER_URL, peerOptionsFromParam, relayBrokersFromParam, makeRoomCode } from './config.js?v=1.5.0';
-import { lineChart, legend } from './chart.js?v=1.5.0';
-import { h, replace, yen, pct, downloadText } from './dom.js?v=1.5.0';
+import * as G from './game.js?v=1.6.0';
+import { HostNet } from './net-host.js?v=1.6.0';
+import { RelayHost, SignalHost } from './relay.js?v=1.6.0';
+import { PEER_ID_PREFIX, DEFAULT_PLAYER_URL, peerOptionsFromParam, relayBrokersFromParam, makeRoomCode } from './config.js?v=1.6.0';
+import { lineChart, legend } from './chart.js?v=1.6.0';
+import { h, replace, yen, pct, downloadText } from './dom.js?v=1.6.0';
 
 /* global qrcode */
 
