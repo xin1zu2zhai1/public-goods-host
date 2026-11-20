@@ -268,6 +268,8 @@ export function dialRelay({ room, brokers, timeout = 15000 }) {
     const clients = [];
     const cid = randomId(16);
     let base;
+    // つながらなかったときの原因調査用：つながったブローカーの数と、ホストの在室情報が見えた数
+    const stats = { total: brokers.length, connected: 0, presence: 0 };
     const timer = setTimeout(() => finish(null, new Error('timeout')), timeout);
 
     function finish(winner, err) {
@@ -284,7 +286,7 @@ export function dialRelay({ room, brokers, timeout = 15000 }) {
         }
       }
       if (winner) resolve(makeChannel(winner));
-      else reject(err);
+      else reject(Object.assign(err, { relay: { ...stats } }));
     }
 
     function makeChannel({ client, session }) {
@@ -358,7 +360,13 @@ export function dialRelay({ room, brokers, timeout = 15000 }) {
           counted = true;
           brokerFailed();
         };
+        let seenConnect = false;
+        let seenPresence = false;
         client.on('connect', () => {
+          if (!seenConnect) {
+            seenConnect = true;
+            stats.connected++;
+          }
           client.subscribe([`${base}/host`, `${base}/dn/${cid}`], { qos: 1 }, (err) => {
             if (err) {
               markFailed();
@@ -381,6 +389,10 @@ export function dialRelay({ room, brokers, timeout = 15000 }) {
                   return;
                 }
                 if (!m || typeof m.pk !== 'string' || typeof m.sid !== 'string' || session?.sid === m.sid) return;
+                if (!seenPresence) {
+                  seenPresence = true;
+                  stats.presence++;
+                }
                 const kp = await genKeys();
                 session = { sid: m.sid, key: await deriveKey(kp.privateKey, m.pk, `${m.sid}:${cid}`) };
                 const s = await seal(session.key, { t: '_open' });
