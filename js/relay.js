@@ -623,10 +623,47 @@ export class SignalHost {
   }
 }
 
-/** 参加者側：PeerJS のサーバー経由でホストにつなぐ。つながったら channel を返す。 */
-export function dialSignal({ hostId, peerOptions, timeout = 14000 }) {
+const FATAL_PEER_ERRORS = ['server-error', 'socket-error', 'socket-closed', 'network', 'browser-incompatible', 'invalid-id', 'invalid-key', 'unavailable-id', 'ssl-unavailable', 'disconnected'];
+
+/** Peer が PeerJS のサーバーにつながるのを待つ（つながっていればすぐ返る） */
+export function peerReady(peer, timeout = 12000) {
   return new Promise((resolve, reject) => {
-    if (typeof Peer === 'undefined' || !globalThis.crypto?.subtle) {
+    if (!peer) {
+      reject(new Error('no-peer'));
+      return;
+    }
+    if (peer.open) {
+      resolve(peer);
+      return;
+    }
+    if (peer.destroyed || peer.disconnected) {
+      reject(Object.assign(new Error('server-error'), { type: 'server-error' }));
+      return;
+    }
+    const done = (err) => {
+      clearTimeout(timer);
+      peer.off('open', onOpen);
+      peer.off('error', onError);
+      if (err) reject(err);
+      else resolve(peer);
+    };
+    const onOpen = () => done();
+    const onError = (e) => {
+      if (FATAL_PEER_ERRORS.includes(e?.type)) done(Object.assign(new Error(e.type), { type: e.type, detail: String(e?.message || '') }));
+    };
+    const timer = setTimeout(() => done(Object.assign(new Error('server-timeout'), { type: 'server-timeout' })), timeout);
+    peer.on('open', onOpen);
+    peer.on('error', onError);
+  });
+}
+
+/**
+ * 参加者側：PeerJS のサーバー経由でホストにつなぐ。つながったら channel を返す。
+ * peer は直接通信と共用する（サーバーへの接続を1本にするため）。peer の後始末は呼び出し側が行う。
+ */
+export function dialSignal({ hostId, peer, timeout = 14000 }) {
+  return new Promise((resolve, reject) => {
+    if (!peer || !globalThis.crypto?.subtle) {
       reject(new Error('sig-unavailable'));
       return;
     }
@@ -635,64 +672,38 @@ export function dialSignal({ hostId, peerOptions, timeout = 14000 }) {
     let ch = null;
     let rq = Promise.resolve();
     let probeTimer = null;
-    let peer;
+    const sock = peer.socket;
+    const cleanup = () => {
+      clearTimeout(timer);
+      clearInterval(probeTimer);
+      sock?.off?.('message', onMessage);
+      peer.off('error', onError);
+      peer.off('disconnected', onDisconnected);
+    };
     const fail = (e) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
-      clearInterval(probeTimer);
-      try {
-        peer?.destroy();
-      } catch {
-        /* ignore */
-      }
+      cleanup();
       reject(e);
     };
     const timer = setTimeout(() => fail(new Error('timeout')), timeout);
-    try {
-      // eslint-disable-next-line no-undef
-      peer = new Peer({ debug: 0, ...peerOptions });
-    } catch (e) {
-      fail(e);
-      return;
-    }
     const send = (payload) => sigSend(peer, hostId, payload);
     const lost = () => {
       if (!ch || ch.closed) return;
       ch.closed = true;
-      try {
-        peer.destroy();
-      } catch {
-        /* ignore */
-      }
+      cleanup();
       ch.onclose?.();
     };
-    peer.on('open', () => {
-      if (settled) return;
-      const started = Date.now();
-      const probe = () => {
-        if (session || settled) {
-          clearInterval(probeTimer);
-          return;
-        }
-        if (Date.now() - started > 8000) {
-          fail(new Error('no-reply'));
-          return;
-        }
-        send({ pgg: 'q' });
-      };
-      probe();
-      probeTimer = setInterval(probe, 1500);
-    });
-    peer.on('error', (e) => {
-      if (!settled) fail(Object.assign(new Error(e?.type || 'error'), { type: e?.type }));
-      else if (e?.type === 'peer-unavailable') lost();
-    });
-    peer.on('disconnected', () => {
+    const onError = (e) => {
+      if (!settled) {
+        if (e?.type === 'peer-unavailable' || FATAL_PEER_ERRORS.includes(e?.type)) fail(Object.assign(new Error(e.type), { type: e.type, detail: String(e?.message || '') }));
+      } else if (e?.type === 'peer-unavailable' || FATAL_PEER_ERRORS.includes(e?.type)) lost();
+    };
+    const onDisconnected = () => {
       if (settled) lost();
-      else fail(new Error('disconnected'));
-    });
-    peer.socket?.on?.('message', (m) => {
+      else fail(Object.assign(new Error('network'), { type: 'network' }));
+    };
+    const onMessage = (m) => {
       if (!m || m.type !== SIG_TYPE || m.src !== hostId || !m.payload || typeof m.payload.pgg !== 'string') return;
       const p = m.payload;
       rq = rq
@@ -702,7 +713,7 @@ export function dialSignal({ hostId, peerOptions, timeout = 14000 }) {
               if (p.sid !== session.sid) lost();
               return;
             }
-            if (session?.sid === p.sid) return;
+            if (settled || session?.sid === p.sid) return;
             const kp = await genKeys();
             session = { sid: p.sid, key: await deriveKey(kp.privateKey, p.pk, `${p.sid}:${peer.id}`) };
             send({ pgg: 'o', pk: await exportPub(kp), sid: p.sid, ...(await seal(session.key, { t: '_open' })) });
@@ -734,7 +745,31 @@ export function dialSignal({ hostId, peerOptions, timeout = 14000 }) {
           else if (msg.t !== '_opened') ch.onmessage?.(msg);
         })
         .catch(() => {});
-    });
+    };
+    peer.on('error', onError);
+    peer.on('disconnected', onDisconnected);
+    sock?.on?.('message', onMessage);
+
+    peerReady(peer, timeout).then(
+      () => {
+        if (settled) return;
+        const started = Date.now();
+        const probe = () => {
+          if (session || settled) {
+            clearInterval(probeTimer);
+            return;
+          }
+          if (Date.now() - started > 8000) {
+            fail(new Error('no-reply'));
+            return;
+          }
+          send({ pgg: 'q' });
+        };
+        probe();
+        probeTimer = setInterval(probe, 1500);
+      },
+      (e) => fail(e),
+    );
 
     function makeChannel() {
       let q = Promise.resolve();
@@ -752,15 +787,7 @@ export function dialSignal({ hostId, peerOptions, timeout = 14000 }) {
           if (c.closed) return;
           c.send({ t: '_bye' });
           c.closed = true;
-          q.finally(() =>
-            setTimeout(() => {
-              try {
-                peer.destroy();
-              } catch {
-                /* ignore */
-              }
-            }, 300),
-          );
+          cleanup();
         },
       };
       return c;
