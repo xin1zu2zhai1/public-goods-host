@@ -4,7 +4,7 @@
 // ホスト側（public-goods-host）と参加者側（public-goods-game）で同じファイルを使う。
 /* global mqtt */
 
-const TOPIC_ROOT = 'pgg7f3k/v1';
+const TOPIC_ROOT = 'pgg7f3k/v2';
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
@@ -84,6 +84,18 @@ export function relayAvailable() {
   return typeof mqtt !== 'undefined' && Boolean(globalThis.crypto?.subtle);
 }
 
+/** ブローカーの短い名前（表示用）。例：wss://broker.emqx.io:8084/mqtt → emqx */
+export function brokerLabel(url) {
+  try {
+    const u = new URL(url);
+    if (/^[\d.]+$|^localhost$|^\[/.test(u.hostname)) return u.host;
+    const parts = u.hostname.split('.');
+    return parts.length >= 2 ? parts[parts.length - 2] : u.hostname;
+  } catch {
+    return String(url);
+  }
+}
+
 function connectBroker(url, opts) {
   return mqtt.connect(url, {
     protocolVersion: 4,
@@ -93,6 +105,15 @@ function connectBroker(url, opts) {
     ...opts,
   });
 }
+
+// ------------------------------------------------------------------ やり取りの手順
+//
+// 参加者 → up      {c, q:1}                    問い合わせ（このルームのホストはいますか？）
+// ホスト → dn/c    {pk, sid}                   ホストの公開鍵とセッションID
+// 参加者 → up      {c, pk, sid, iv, d}         参加者の公開鍵と、暗号化した {t:'_open'}
+// ホスト → dn/c    {iv, d}                     暗号化した {t:'_opened'}（以後はすべて暗号化）
+// ホストが知らない相手から暗号文が届いたら {e:'rekey'} を返し、参加者はつなぎ直す。
+// 「ルームあり」の印をブローカーに残す方式（retained）は、ブローカーによって消えたり残ったりするので使わない。
 
 // ------------------------------------------------------------------ ホスト側
 
@@ -141,7 +162,7 @@ export class RelayHost {
    * @param {object} opts
    * @param {string} opts.room
    * @param {string[]} opts.brokers
-   * @param {(s:{connected:number,total:number})=>void} opts.onStatus
+   * @param {(s:{connected:number,total:number,brokers:{label:string,connected:boolean}[]})=>void} opts.onStatus
    * @param {(conn:RelayConn,msg:any)=>void} opts.onMessage
    * @param {(conn:RelayConn)=>void} opts.onClose
    */
@@ -155,7 +176,7 @@ export class RelayHost {
 
   async start() {
     if (!relayAvailable()) {
-      this.opts.onStatus?.({ connected: 0, total: 0 });
+      this.opts.onStatus?.({ connected: 0, total: 0, brokers: [] });
       return;
     }
     this.base = await topicBase(this.opts.room);
@@ -168,21 +189,21 @@ export class RelayHost {
   }
 
   _status() {
-    this.opts.onStatus?.({ connected: this.clients.filter((c) => c.connected).length, total: this.clients.length });
+    const brokers = this.clients.map((c) => ({ label: brokerLabel(c.pggUrl), connected: Boolean(c.connected && c.pggSubscribed) }));
+    this.opts.onStatus?.({ connected: brokers.filter((b) => b.connected).length, total: brokers.length, brokers });
   }
 
   _connect(url) {
-    const presence = `${this.base}/host`;
-    const client = connectBroker(url, {
-      clientId: `pggh${randomId(8)}`,
-      reconnectPeriod: 4000,
-      will: { topic: presence, payload: '', retain: true, qos: 1 },
-    });
+    const client = connectBroker(url, { clientId: `pggh${randomId(8)}`, reconnectPeriod: 4000 });
     client.pggUrl = url;
+    client.pggSubscribed = false;
     this.clients.push(client);
     client.on('connect', () => {
-      client.subscribe(`${this.base}/up`, { qos: 1 });
-      client.publish(presence, JSON.stringify({ pk: this.pub, sid: this.sid, t: Date.now() }), { retain: true, qos: 1 });
+      client.pggSubscribed = false;
+      client.subscribe(`${this.base}/up`, { qos: 1 }, (err) => {
+        client.pggSubscribed = !err;
+        this._status();
+      });
       this._status();
     });
     client.on('message', (topic, payload) => {
@@ -193,13 +214,23 @@ export class RelayHost {
     client.on('error', (e) => console.warn('relay broker error', url, e?.message));
   }
 
+  _reply(client, cid, obj) {
+    client.publish(`${this.base}/dn/${cid}`, JSON.stringify(obj), { qos: 1 });
+  }
+
   async _onUp(client, payload) {
     const m = parse(payload);
-    if (!m || typeof m.c !== 'string' || !/^[0-9a-f]{16,64}$/.test(m.c) || typeof m.iv !== 'string' || typeof m.d !== 'string') return;
+    if (!m || typeof m.c !== 'string' || !/^[0-9a-f]{16,64}$/.test(m.c)) return;
+    // 問い合わせ：公開鍵を返す
+    if (m.q) {
+      this._reply(client, m.c, { pk: this.pub, sid: this.sid });
+      return;
+    }
+    if (typeof m.iv !== 'string' || typeof m.d !== 'string') return;
     let conn = this.conns.get(m.c);
     if (typeof m.pk === 'string') {
       if (m.sid !== this.sid) {
-        client.publish(`${this.base}/dn/${m.c}`, JSON.stringify({ e: 'rekey' }), { qos: 1 });
+        this._reply(client, m.c, { pk: this.pub, sid: this.sid });
         return;
       }
       const key = await deriveKey(this.keys.privateKey, m.pk, `${this.sid}:${m.c}`);
@@ -217,7 +248,7 @@ export class RelayHost {
       return;
     }
     if (!conn) {
-      client.publish(`${this.base}/dn/${m.c}`, JSON.stringify({ e: 'rekey' }), { qos: 1 });
+      this._reply(client, m.c, { e: 'rekey' });
       return;
     }
     conn.client = client;
@@ -240,8 +271,6 @@ export class RelayHost {
     for (const conn of [...this.conns.values()]) conn.close();
     for (const c of this.clients) {
       try {
-        // 「ルームなし」に戻してから切る（正常終了では遺言メッセージが送られないため）
-        if (this.base) c.publish(`${this.base}/host`, '', { retain: true, qos: 1 });
         c.end(false);
       } catch {
         /* ignore */
@@ -254,9 +283,13 @@ export class RelayHost {
 
 // ------------------------------------------------------------------ 参加者側
 
+const PROBE_EVERY = 1500;
+const PROBE_GIVE_UP = 6000;
+
 /**
- * 中継でホストにつなぐ。つながったら channel を返す。
- * channel: { kind, send(msg):boolean, close(), onmessage, onclose }
+ * 中継でホストにつなぐ。すべてのブローカーに同時に問い合わせ、最初に応答したところを使う。
+ * つながったら channel を返す。channel: { kind, send(msg):boolean, close(), onmessage, onclose }
+ * つながらなかったときの Error には relay.brokers（ブローカーごとの状況）が付く。
  */
 export function dialRelay({ room, brokers, timeout = 15000 }) {
   return new Promise((resolve, reject) => {
@@ -268,9 +301,18 @@ export function dialRelay({ room, brokers, timeout = 15000 }) {
     const clients = [];
     const cid = randomId(16);
     let base;
-    // つながらなかったときの原因調査用：つながったブローカーの数と、ホストの在室情報が見えた数
-    const stats = { total: brokers.length, connected: 0, presence: 0 };
+    // ブローカーごとの状況（原因の表示用）。state: connecting | connected | failed
+    const report = brokers.map((url) => ({ label: brokerLabel(url), state: 'connecting', host: false, error: '' }));
     const timer = setTimeout(() => finish(null, new Error('timeout')), timeout);
+
+    function summary() {
+      return {
+        total: report.length,
+        connected: report.filter((r) => r.state === 'connected' || r.wasConnected).length,
+        presence: report.filter((r) => r.host).length,
+        brokers: report.map(({ label, state, host, error, wasConnected }) => ({ label, connected: state === 'connected' || Boolean(wasConnected), host, error })),
+      };
+    }
 
     function finish(winner, err) {
       if (settled) return;
@@ -286,14 +328,18 @@ export function dialRelay({ room, brokers, timeout = 15000 }) {
         }
       }
       if (winner) resolve(makeChannel(winner));
-      else reject(Object.assign(err, { relay: { ...stats } }));
+      else reject(Object.assign(err, { relay: summary() }));
+    }
+
+    function checkAllFailed() {
+      if (report.every((r) => r.state === 'failed')) finish(null, new Error('no-host'));
     }
 
     function makeChannel({ client, session }) {
       let q = Promise.resolve();
       const ch = {
         kind: 'relay',
-        broker: client.pggUrl,
+        broker: brokerLabel(client.pggUrl),
         closed: false,
         onmessage: null,
         onclose: null,
@@ -339,67 +385,69 @@ export function dialRelay({ room, brokers, timeout = 15000 }) {
       return ch;
     }
 
-    let failed = 0;
-    const brokerFailed = () => {
-      failed++;
-      if (failed >= brokers.length) finish(null, new Error('no-broker'));
-    };
-
     topicBase(room).then((b) => {
       base = b;
-      for (const url of brokers) {
-        if (settled) break;
+      brokers.forEach((url, idx) => {
+        if (settled) return;
+        const r = report[idx];
         const client = connectBroker(url, { clientId: `pggp${randomId(8)}`, reconnectPeriod: 0 });
         client.pggUrl = url;
         clients.push(client);
         let session = null;
         let rq = Promise.resolve();
-        let counted = false;
-        const markFailed = () => {
-          if (counted || client.pggOnLost) return;
-          counted = true;
-          brokerFailed();
+        let probeTimer = null;
+        const fail = (why) => {
+          clearInterval(probeTimer);
+          if (client.pggOnLost || r.state === 'failed') return;
+          if (r.state === 'connected') r.wasConnected = true;
+          r.state = 'failed';
+          if (why && !r.error) r.error = why;
+          checkAllFailed();
         };
-        let seenConnect = false;
-        let seenPresence = false;
         client.on('connect', () => {
-          if (!seenConnect) {
-            seenConnect = true;
-            stats.connected++;
-          }
-          client.subscribe([`${base}/host`, `${base}/dn/${cid}`], { qos: 1 }, (err) => {
+          r.state = 'connected';
+          client.subscribe(`${base}/dn/${cid}`, { qos: 1 }, (err) => {
             if (err) {
-              markFailed();
+              fail('subscribe');
               return;
             }
-            // 在室情報（retained）は購読直後に届く。届かなければ、このブローカーにはホストがいない。
-            setTimeout(() => {
-              if (!session) markFailed();
-            }, 4000);
+            // ホストに問い合わせる。返事がなければ、このブローカーにはホストがいない。
+            const started = Date.now();
+            const probe = () => {
+              if (session || settled) {
+                clearInterval(probeTimer);
+                return;
+              }
+              if (Date.now() - started > PROBE_GIVE_UP) {
+                fail('no-host');
+                return;
+              }
+              client.publish(`${base}/up`, JSON.stringify({ c: cid, q: 1 }), { qos: 1 });
+            };
+            probe();
+            probeTimer = setInterval(probe, PROBE_EVERY);
           });
         });
         client.on('message', (topic, payload) => {
           rq = rq
             .then(async () => {
               const m = parse(payload);
-              if (topic === `${base}/host`) {
-                // ホストの在室情報。空ならホストがいない。sid が変わったらホストが開き直した。
+              if (!m) return;
+              if (typeof m.pk === 'string' && typeof m.sid === 'string') {
+                // ホストの返事（公開鍵）。つながった後に sid が変わったら、ホストが開き直した。
                 if (client.pggOnLost) {
-                  if (!m || m.sid !== client.pggSessionId) client.pggOnLost();
+                  if (m.sid !== client.pggSessionId) client.pggOnLost();
                   return;
                 }
-                if (!m || typeof m.pk !== 'string' || typeof m.sid !== 'string' || session?.sid === m.sid) return;
-                if (!seenPresence) {
-                  seenPresence = true;
-                  stats.presence++;
-                }
+                r.host = true;
+                if (session?.sid === m.sid) return;
+                clearInterval(probeTimer);
                 const kp = await genKeys();
                 session = { sid: m.sid, key: await deriveKey(kp.privateKey, m.pk, `${m.sid}:${cid}`) };
                 const s = await seal(session.key, { t: '_open' });
                 client.publish(`${base}/up`, JSON.stringify({ c: cid, pk: await exportPub(kp), sid: m.sid, ...s }), { qos: 1 });
                 return;
               }
-              if (!m) return;
               if (m.e === 'rekey') {
                 if (client.pggOnLost) client.pggOnLost();
                 return;
@@ -418,10 +466,12 @@ export function dialRelay({ room, brokers, timeout = 15000 }) {
         });
         client.on('close', () => {
           if (client.pggOnLost) client.pggOnLost();
-          else markFailed();
+          else fail(r.state === 'connecting' ? 'connect' : 'closed');
         });
-        client.on('error', () => {});
-      }
+        client.on('error', (e) => {
+          if (!r.error) r.error = e?.message || 'error';
+        });
+      });
     }, reject);
   });
 }

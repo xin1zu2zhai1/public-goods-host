@@ -1,9 +1,9 @@
-import * as G from './game.js?v=1.2.0';
-import { HostNet } from './net-host.js?v=1.2.0';
-import { RelayHost } from './relay.js?v=1.2.0';
-import { PEER_ID_PREFIX, DEFAULT_PLAYER_URL, peerOptionsFromParam, relayBrokersFromParam, makeRoomCode } from './config.js?v=1.2.0';
-import { lineChart, legend } from './chart.js?v=1.2.0';
-import { h, replace, yen, pct, downloadText } from './dom.js?v=1.2.0';
+import * as G from './game.js?v=1.3.0';
+import { HostNet } from './net-host.js?v=1.3.0';
+import { RelayHost } from './relay.js?v=1.3.0';
+import { PEER_ID_PREFIX, DEFAULT_PLAYER_URL, peerOptionsFromParam, relayBrokersFromParam, makeRoomCode } from './config.js?v=1.3.0';
+import { lineChart, legend } from './chart.js?v=1.3.0';
+import { h, replace, yen, pct, downloadText } from './dom.js?v=1.3.0';
 
 /* global qrcode */
 
@@ -207,6 +207,8 @@ function renderNetStatus() {
   const rel = relayStatus.total ? `中継 ${relayStatus.connected}/${relayStatus.total}` : '中継なし';
   el.textContent = `${ready ? '接続OK' : '接続の準備中…'}（直接${direct}・${rel}）`;
   el.title = '直接＝ブラウザ同士の直接通信（WebRTC）／中継＝暗号化して中継サーバー（MQTT）経由で通信。どちらか一方がつながっていれば参加できます。';
+  const brokers = relayStatus.brokers ?? [];
+  $('netDetail').textContent = `通信の状態：直接 ${direct}${brokers.length ? ` ・ 中継 ${brokers.map((b) => `${b.label}${b.connected ? '○' : '×'}`).join(' ')}` : ''}`;
   renderAlerts();
 }
 

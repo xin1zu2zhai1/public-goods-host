@@ -878,3 +878,7 @@ body.projector {
   color: var(--muted);
   padding: 8px 16px 24px;
 }
+.net-detail {
+  margin-top: 8px;
+  word-break: break-word;
+}
