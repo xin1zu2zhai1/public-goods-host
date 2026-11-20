@@ -1,6 +1,7 @@
 import * as G from './game.js';
 import { HostNet } from './net-host.js';
-import { PEER_ID_PREFIX, DEFAULT_PLAYER_URL, peerOptionsFromParam, makeRoomCode } from './config.js';
+import { RelayHost } from './relay.js';
+import { PEER_ID_PREFIX, DEFAULT_PLAYER_URL, peerOptionsFromParam, relayBrokersFromParam, makeRoomCode } from './config.js';
 import { lineChart, legend } from './chart.js';
 import { h, replace, yen, pct, downloadText } from './dom.js';
 
@@ -12,11 +13,16 @@ const UI_KEY = 'pgg-host-ui';
 const params = new URLSearchParams(location.search);
 const peerParam = params.get('peer') || '';
 const peerOptions = peerOptionsFromParam(peerParam);
+const relayParam = params.get('relay') || '';
+const relayBrokers = relayBrokersFromParam(relayParam);
 
 const $ = (id) => document.getElementById(id);
 
 let state = null;
-let net = null;
+let net = null; // 直接（WebRTC / PeerJS）
+let relay = null; // 中継（MQTT・暗号化）
+let relayStatus = { connected: 0, total: 0 };
+let netStartedAt = 0;
 const conns = new Map(); // pid -> conn
 const connPid = new Map(); // conn -> pid
 const lastSeen = new Map(); // pid -> time
@@ -91,6 +97,7 @@ function joinUrl() {
   }
   u.searchParams.set('room', state.roomCode);
   if (peerParam) u.searchParams.set('peer', peerParam);
+  if (relayParam) u.searchParams.set('relay', relayParam);
   return u.toString();
 }
 
@@ -128,7 +135,7 @@ function sendView(pid, conn, ctx, force = false) {
   const json = JSON.stringify(view);
   if (!force && lastSent.get(pid) === json) return;
   lastSent.set(pid, json);
-  net?.send(conn, view);
+  sendTo(conn, view);
 }
 
 function checkAuto() {
@@ -149,8 +156,18 @@ function checkAuto() {
 
 // ------------------------------------------------------------------ 通信
 
+function sendTo(conn, msg) {
+  try {
+    if (conn && conn.open) conn.send(msg);
+  } catch (e) {
+    console.warn('send failed', e);
+  }
+}
+
+/** 直接（WebRTC）と中継（MQTT）の両方で参加者を待ち受ける */
 function startNet() {
   net?.destroy();
+  relay?.destroy();
   conns.clear();
   connPid.clear();
   lastSent.clear();
@@ -162,20 +179,39 @@ function startNet() {
     onClose,
   });
   net.start();
+  netStartedAt = Date.now();
+  relayStatus = { connected: 0, total: relayBrokers.length };
+  relay = new RelayHost({
+    room: state.roomCode,
+    brokers: relayBrokers,
+    onStatus: (st) => {
+      relayStatus = st;
+      renderNetStatus();
+    },
+    onMessage,
+    onClose,
+  });
+  relay.start().catch((e) => console.warn('relay start failed', e));
+  renderNetStatus();
 }
 
-function onNetStatus(s, detail) {
-  netStatus = s;
+function netReady() {
+  return netStatus === 'online' || relayStatus.connected > 0;
+}
+
+function renderNetStatus() {
   const el = $('netStatus');
-  el.dataset.s = s;
-  const text = {
-    connecting: detail || 'サーバーに接続中…',
-    online: '接続OK',
-    reconnecting: '再接続中…',
-    'id-taken': 'ルームコードが使えません',
-    error: detail || '接続エラー',
-  }[s] ?? s;
-  el.textContent = text;
+  const ready = netReady();
+  el.dataset.s = ready ? 'online' : netStatus === 'error' || netStatus === 'id-taken' ? 'error' : 'connecting';
+  const direct = netStatus === 'online' ? '○' : netStatus === 'connecting' || netStatus === 'reconnecting' ? '…' : '×';
+  const rel = relayStatus.total ? `中継 ${relayStatus.connected}/${relayStatus.total}` : '中継なし';
+  el.textContent = `${ready ? '接続OK' : '接続の準備中…'}（直接${direct}・${rel}）`;
+  el.title = '直接＝ブラウザ同士の直接通信（WebRTC）／中継＝暗号化して中継サーバー（MQTT）経由で通信。どちらか一方がつながっていれば参加できます。';
+  renderAlerts();
+}
+
+function onNetStatus(s) {
+  netStatus = s;
   if (s === 'id-taken') {
     showModal(
       'このルームコードは使用中です',
@@ -187,7 +223,7 @@ function onNetStatus(s, detail) {
       { dismissable: false },
     );
   }
-  renderAlerts();
+  renderNetStatus();
 }
 
 function onMessage(conn, msg) {
@@ -195,22 +231,22 @@ function onMessage(conn, msg) {
   const pid = connPid.get(conn);
   if (pid) lastSeen.set(pid, Date.now());
   if (msg.t === 'hello') return onHello(conn, msg);
-  if (msg.t === 'ping') return net.send(conn, { t: 'pong' });
+  if (msg.t === 'ping') return sendTo(conn, { t: 'pong' });
   if (!pid || conns.get(pid) !== conn) return;
 
   if (msg.t === 'contribute') {
     const r = G.submitContribution(state, pid, msg.amount);
-    net.send(conn, { t: 'ack', what: 'contribute', ok: r.ok, reason: r.reason });
+    sendTo(conn, { t: 'ack', what: 'contribute', ok: r.ok, reason: r.reason });
     if (r.ok) changed();
   } else if (msg.t === 'punish') {
     const r = G.submitPunishment(state, pid, msg.alloc);
-    net.send(conn, { t: 'ack', what: 'punish', ok: r.ok, reason: r.reason });
+    sendTo(conn, { t: 'ack', what: 'punish', ok: r.ok, reason: r.reason });
     if (r.ok) changed();
   } else if (msg.t === 'comment') {
     const now = Date.now();
     const times = (commentLog.get(pid) ?? []).filter((t) => now - t < 60000);
     if (times.length >= 3) {
-      net.send(conn, { t: 'ack', what: 'comment', ok: false, reason: 'rate' });
+      sendTo(conn, { t: 'ack', what: 'comment', ok: false, reason: 'rate' });
       return;
     }
     const r = G.addComment(state, msg.text);
@@ -219,7 +255,7 @@ function onMessage(conn, msg) {
       commentLog.set(pid, times);
       changed();
     }
-    net.send(conn, { t: 'ack', what: 'comment', ok: r.ok, reason: r.reason });
+    sendTo(conn, { t: 'ack', what: 'comment', ok: r.ok, reason: r.reason });
   } else if (msg.t === 'sync') {
     sendView(pid, conn, null, true);
   }
@@ -227,13 +263,13 @@ function onMessage(conn, msg) {
 
 function onHello(conn, msg) {
   if (msg.v !== G.PROTOCOL_VERSION) {
-    net.send(conn, { t: 'refused', reason: 'version' });
+    sendTo(conn, { t: 'refused', reason: 'version' });
     setTimeout(() => conn.close(), 400);
     return;
   }
   const r = G.addPlayer(state, String(msg.pid ?? ''), msg.name);
   if (!r.ok) {
-    net.send(conn, { t: 'refused', reason: r.reason });
+    sendTo(conn, { t: 'refused', reason: r.reason });
     setTimeout(() => conn.close(), 400);
     return;
   }
@@ -241,7 +277,7 @@ function onHello(conn, msg) {
   const old = conns.get(pid);
   if (old && old !== conn) {
     connPid.delete(old);
-    net.send(old, { t: 'replaced' });
+    sendTo(old, { t: 'replaced' });
     setTimeout(() => {
       try {
         old.close();
@@ -256,7 +292,7 @@ function onHello(conn, msg) {
   connPid.set(conn, pid);
   lastSeen.set(pid, Date.now());
   lastSent.delete(pid);
-  net.send(conn, { t: 'welcome', v: G.PROTOCOL_VERSION, pid, name: r.player.name, room: state.roomCode });
+  sendTo(conn, { t: 'welcome', v: G.PROTOCOL_VERSION, pid, name: r.player.name, room: state.roomCode });
   changed();
 }
 
@@ -271,6 +307,7 @@ function onClose(conn) {
 }
 
 setInterval(() => {
+  if (state && !netReady()) renderAlerts();
   const now = Date.now();
   for (const [pid, conn] of conns) {
     if (now - (lastSeen.get(pid) ?? 0) > 25000) {
@@ -343,7 +380,7 @@ function kick(pid) {
         const conn = conns.get(pid);
         G.removePlayer(state, pid);
         if (conn) {
-          net.send(conn, { t: 'refused', reason: 'removed' });
+          sendTo(conn, { t: 'refused', reason: 'removed' });
           conns.delete(pid);
           connPid.delete(conn);
           setTimeout(() => {
@@ -363,7 +400,7 @@ function kick(pid) {
 
 function newRoom(skipConfirm = false) {
   const doIt = () => {
-    for (const conn of conns.values()) net.send(conn, { t: 'closed' });
+    for (const conn of conns.values()) sendTo(conn, { t: 'closed' });
     const settings = { ...state.settings, punishment: false, acceptComments: false };
     state = G.createState(makeRoomCode(), settings);
     lastSeen.clear();
@@ -467,8 +504,13 @@ function renderJoin() {
   const n = G.activePlayers(state).length;
   $('playerCount').textContent = String(n);
   $('playerCountBig').textContent = String(n);
-  const online = G.activePlayers(state).filter((p) => conns.has(p.pid)).length;
-  $('onlineCount').textContent = n ? `接続中 ${online}人${state.settings.acceptJoin ? '' : '・新規の参加は締め切り中'}` : state.settings.acceptJoin ? '' : '新規の参加は締め切り中';
+  const online = G.activePlayers(state).filter((p) => conns.has(p.pid));
+  const viaRelay = online.filter((p) => conns.get(p.pid)?.kind === 'relay').length;
+  $('onlineCount').textContent = n
+    ? `接続中 ${online.length}人${viaRelay ? `（うち中継 ${viaRelay}人）` : ''}${state.settings.acceptJoin ? '' : '・新規の参加は締め切り中'}`
+    : state.settings.acceptJoin
+      ? ''
+      : '新規の参加は締め切り中';
 }
 
 function renderControl() {
@@ -619,8 +661,15 @@ function stat(k, v, sub) {
 
 function renderAlerts() {
   const out = [];
-  if (netStatus === 'error') out.push(h('div', { class: 'alert danger' }, `通信の準備ができませんでした：${$('netStatus').textContent}`));
-  if (netStatus === 'reconnecting') out.push(h('div', { class: 'alert' }, 'サーバーとの接続が切れました。自動で再接続しています（接続済みの参加者とは通信できます）。'));
+  if (!netReady() && (netStatus === 'error' || Date.now() - netStartedAt > 10000)) {
+    out.push(
+      h(
+        'div',
+        { class: netStatus === 'error' ? 'alert danger' : 'alert' },
+        '通信サーバーにつながっていません。インターネットにつながっているか確認してください（自動で再接続しています）。',
+      ),
+    );
+  }
   if (state && state.groups.some((g) => g.members.length === 1) && G.activePlayers(state).length > 1) {
     out.push(h('div', { class: 'alert' }, '1人だけのグループがあります。「グループを組み直す」で調整できます。'));
   }
@@ -1057,6 +1106,8 @@ function bindEvents() {
       if (modalDismissable) $('modal').hidden = true;
     }
   });
+  // ページを離れるときは中継サーバー上の「ルームあり」の印を消す
+  window.addEventListener('pagehide', () => relay?.destroy());
   window.addEventListener('beforeunload', (e) => {
     if (conns.size > 0) {
       e.preventDefault();

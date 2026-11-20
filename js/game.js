@@ -594,9 +594,9 @@ export function playerView(state, pid, ctx = {}) {
 
   if (membership && (phase === 'contribute' || phase === 'punish')) {
     const pr = ctx.progress ?? progress(state);
+    // クラス全体の進捗は含めない（誰かが入力するたびに全員へ送り直すことになるため）
     view.progress = {
       group: pr.groups[membership.id] ?? { submitted: 0, total: 0 },
-      all: { submitted: pr.submitted, total: pr.total },
     };
   }
 

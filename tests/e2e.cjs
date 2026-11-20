@@ -6,7 +6,12 @@ const { chromium } = require('playwright');
 const path = require('path');
 
 const OUT = process.env.OUT || path.join(__dirname, 'shots');
-const HOST = process.env.HOST_URL || 'http://localhost:8001/?peer=127.0.0.1:9000&player=http://localhost:8002/';
+// RELAY=ws://127.0.0.1:8883 で中継（MQTT）も使う。BLOCK_P2P=1 で参加者の直接通信（WebRTC の UDP）を止める。
+const RELAY = process.env.RELAY || '';
+const BLOCK_P2P = process.env.BLOCK_P2P === '1';
+const HOST =
+  process.env.HOST_URL ||
+  `http://localhost:8001/?peer=127.0.0.1:9000&player=http://localhost:8002/${RELAY ? `&relay=${encodeURIComponent(RELAY)}` : '&relay=off'}`;
 const N = Number(process.env.N || 6);
 const errors = [];
 
@@ -20,6 +25,9 @@ function watch(page, name) {
 (async () => {
   require('fs').mkdirSync(OUT, { recursive: true });
   const browser = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
+  const playerBrowser = BLOCK_P2P
+    ? await chromium.launch({ args: ['--force-webrtc-ip-handling-policy=disable_non_proxied_udp'] })
+    : browser;
   const hostCtx = await browser.newContext({ viewport: { width: 1280, height: 900 }, deviceScaleFactor: 1 });
   const host = await hostCtx.newPage();
   watch(host, 'host');
@@ -31,7 +39,7 @@ function watch(page, name) {
 
   const players = [];
   for (let i = 0; i < N; i++) {
-    const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 1, isMobile: true, hasTouch: true });
+    const ctx = await playerBrowser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 1, isMobile: true, hasTouch: true });
     const page = await ctx.newPage();
     watch(page, `p${i + 1}`);
     await page.goto(joinUrl);
@@ -41,7 +49,11 @@ function watch(page, name) {
   }
   for (const p of players) await p.page.waitForSelector('text=参加しました', { timeout: 20000 });
   await host.waitForFunction((n) => document.querySelector('#playerCount').textContent === String(n), N);
-  console.log('all joined');
+  console.log('all joined:', await host.textContent('#onlineCount'));
+  if (BLOCK_P2P) {
+    const kinds = await Promise.all(players.map((p) => p.page.textContent('#netStatus')));
+    if (!kinds.every((k) => k.includes('中継'))) throw new Error(`expected relay for all players: ${kinds}`);
+  }
   await host.screenshot({ path: `${OUT}/01-host-lobby.png`, fullPage: false });
   await players[0].page.screenshot({ path: `${OUT}/02-player-lobby.png` });
 
@@ -170,6 +182,7 @@ function watch(page, name) {
   if (overflow) console.log('WARN host horizontal overflow at 390px');
 
   console.log('errors:', errors.length ? errors.join('\n') : 'none');
+  if (playerBrowser !== browser) await playerBrowser.close();
   await browser.close();
 })().catch((e) => {
   console.error('FAILED', e);
