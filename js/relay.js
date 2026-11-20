@@ -1,8 +1,10 @@
 // 中継（リレー）通信。ブラウザ同士が直接つながらないとき（スマホのモバイル回線など）に使う。
-// 公開の MQTT ブローカーに WebSocket(wss) でつなぎ、ホストと参加者のメッセージを中継してもらう。
+// 中継路は2種類：
+//  - PeerJS 中継：直接通信の仲介に使う PeerJS のサーバー（443番）に、メッセージそのものを転送してもらう
+//  - MQTT 中継：公開の MQTT ブローカーに WebSocket(wss) でつなぎ、メッセージを中継してもらう
 // 中身は端末ごとの鍵（ECDH P-256 → AES-GCM）で暗号化するので、ブローカーや第三者には読めない。
 // ホスト側（public-goods-host）と参加者側（public-goods-game）で同じファイルを使う。
-/* global mqtt */
+/* global mqtt, Peer */
 
 const TOPIC_ROOT = 'pgg7f3k/v2';
 const enc = new TextEncoder();
@@ -39,15 +41,15 @@ export async function topicBase(room) {
   return `${TOPIC_ROOT}/${hex(h).slice(0, 24)}`;
 }
 
-async function genKeys() {
+export async function genKeys() {
   return crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
 }
 
-async function exportPub(kp) {
+export async function exportPub(kp) {
   return b64(await crypto.subtle.exportKey('raw', kp.publicKey));
 }
 
-async function deriveKey(privateKey, peerPubB64, salt) {
+export async function deriveKey(privateKey, peerPubB64, salt) {
   const pub = await crypto.subtle.importKey('raw', unb64(peerPubB64), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
   const bits = await crypto.subtle.deriveBits({ name: 'ECDH', public: pub }, privateKey, 256);
   const hk = await crypto.subtle.importKey('raw', bits, 'HKDF', false, ['deriveKey']);
@@ -60,13 +62,13 @@ async function deriveKey(privateKey, peerPubB64, salt) {
   );
 }
 
-async function seal(key, obj) {
+export async function seal(key, obj) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(JSON.stringify(obj)));
   return { iv: b64(iv), d: b64(data) };
 }
 
-async function unseal(key, m) {
+export async function unseal(key, m) {
   const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(m.iv) }, key, unb64(m.d));
   return JSON.parse(dec.decode(plain));
 }
@@ -473,5 +475,295 @@ export function dialRelay({ room, brokers, timeout = 15000 }) {
         });
       });
     }, reject);
+  });
+}
+
+// ================================================================== PeerJS 中継
+// PeerJS のサーバーは、接続の仲介メッセージ（type: CANDIDATE など）の payload を見ずに相手へ転送する。
+// それを使って、暗号化したメッセージを運ぶ。payload に connectionId を付けないので、PeerJS 本体は無視する。
+//
+// 参加者 → ホスト  {pgg:'q'}                         問い合わせ
+// ホスト → 参加者  {pgg:'k', pk, sid}                ホストの公開鍵
+// 参加者 → ホスト  {pgg:'o', pk, sid, iv, d}         参加者の公開鍵と暗号化した {t:'_open'}
+// 双方            {pgg:'m', iv, d}                  暗号化したメッセージ
+// ホスト → 参加者  {pgg:'rekey'}                     知らない相手（ホストが開き直した）→ つなぎ直す
+
+const SIG_TYPE = 'CANDIDATE';
+
+function sigSend(peer, dst, payload) {
+  try {
+    peer?.socket?.send({ type: SIG_TYPE, dst, payload });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+class SignalConn {
+  constructor(hub, id, key) {
+    this.hub = hub;
+    this.id = id;
+    this.key = key;
+    this.kind = 'sig';
+    this.open = true;
+    this.q = Promise.resolve();
+  }
+
+  send(msg) {
+    if (!this.open) return;
+    this._push(msg);
+  }
+
+  _push(msg) {
+    this.q = this.q
+      .then(async () => sigSend(this.hub.peer, this.id, { pgg: 'm', ...(await seal(this.key, msg)) }))
+      .catch((e) => console.warn('sig send failed', e));
+  }
+
+  close() {
+    if (!this.open) return;
+    this._push({ t: '_bye' });
+    this._drop();
+  }
+
+  _drop() {
+    if (!this.open) return;
+    this.open = false;
+    if (this.hub.conns.get(this.id) === this) this.hub.conns.delete(this.id);
+    this.hub.opts.onClose?.(this);
+  }
+}
+
+/** ホスト側：PeerJS のサーバー経由で届く中継メッセージを受ける */
+export class SignalHost {
+  /**
+   * @param {object} opts
+   * @param {(conn:SignalConn,msg:any)=>void} opts.onMessage
+   * @param {(conn:SignalConn)=>void} opts.onClose
+   */
+  constructor(opts) {
+    this.opts = opts;
+    this.conns = new Map();
+    this.peer = null;
+    this.q = Promise.resolve();
+    this.ready = globalThis.crypto?.subtle
+      ? (async () => {
+          this.keys = await genKeys();
+          this.pub = await exportPub(this.keys);
+          this.sid = randomId(8);
+        })()
+      : Promise.reject(new Error('no-crypto'));
+    this.ready.catch(() => {});
+  }
+
+  /** HostNet が Peer を作るたびに呼ぶ */
+  attach(peer) {
+    this.peer = peer;
+    const sock = peer?.socket;
+    if (!sock?.on) return;
+    sock.on('message', (m) => {
+      if (peer !== this.peer || !m || m.type !== SIG_TYPE || typeof m.src !== 'string' || m.src.length > 80) return;
+      const p = m.payload;
+      if (!p || typeof p.pgg !== 'string') return;
+      this.q = this.q.then(() => this._on(m.src, p)).catch((e) => console.warn('sig recv failed', e));
+    });
+  }
+
+  async _on(src, p) {
+    await this.ready;
+    if (p.pgg === 'q') {
+      sigSend(this.peer, src, { pgg: 'k', pk: this.pub, sid: this.sid });
+      return;
+    }
+    if (typeof p.iv !== 'string' || typeof p.d !== 'string') return;
+    if (p.pgg === 'o') {
+      if (p.sid !== this.sid || typeof p.pk !== 'string') {
+        sigSend(this.peer, src, { pgg: 'k', pk: this.pub, sid: this.sid });
+        return;
+      }
+      const key = await deriveKey(this.keys.privateKey, p.pk, `${this.sid}:${src}`);
+      let first;
+      try {
+        first = await unseal(key, p);
+      } catch {
+        return;
+      }
+      if (first?.t !== '_open') return;
+      this.conns.get(src)?._drop();
+      const conn = new SignalConn(this, src, key);
+      this.conns.set(src, conn);
+      conn.send({ t: '_opened' });
+      return;
+    }
+    if (p.pgg === 'm') {
+      const conn = this.conns.get(src);
+      if (!conn) {
+        sigSend(this.peer, src, { pgg: 'rekey' });
+        return;
+      }
+      let msg;
+      try {
+        msg = await unseal(conn.key, p);
+      } catch {
+        return;
+      }
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.t === '_bye') {
+        conn._drop();
+        return;
+      }
+      this.opts.onMessage?.(conn, msg);
+    }
+  }
+
+  destroy() {
+    for (const conn of [...this.conns.values()]) conn.close();
+    this.conns.clear();
+    this.peer = null;
+  }
+}
+
+/** 参加者側：PeerJS のサーバー経由でホストにつなぐ。つながったら channel を返す。 */
+export function dialSignal({ hostId, peerOptions, timeout = 14000 }) {
+  return new Promise((resolve, reject) => {
+    if (typeof Peer === 'undefined' || !globalThis.crypto?.subtle) {
+      reject(new Error('sig-unavailable'));
+      return;
+    }
+    let settled = false;
+    let session = null;
+    let ch = null;
+    let rq = Promise.resolve();
+    let probeTimer = null;
+    let peer;
+    const fail = (e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(probeTimer);
+      try {
+        peer?.destroy();
+      } catch {
+        /* ignore */
+      }
+      reject(e);
+    };
+    const timer = setTimeout(() => fail(new Error('timeout')), timeout);
+    try {
+      // eslint-disable-next-line no-undef
+      peer = new Peer({ debug: 0, ...peerOptions });
+    } catch (e) {
+      fail(e);
+      return;
+    }
+    const send = (payload) => sigSend(peer, hostId, payload);
+    const lost = () => {
+      if (!ch || ch.closed) return;
+      ch.closed = true;
+      try {
+        peer.destroy();
+      } catch {
+        /* ignore */
+      }
+      ch.onclose?.();
+    };
+    peer.on('open', () => {
+      if (settled) return;
+      const started = Date.now();
+      const probe = () => {
+        if (session || settled) {
+          clearInterval(probeTimer);
+          return;
+        }
+        if (Date.now() - started > 8000) {
+          fail(new Error('no-reply'));
+          return;
+        }
+        send({ pgg: 'q' });
+      };
+      probe();
+      probeTimer = setInterval(probe, 1500);
+    });
+    peer.on('error', (e) => {
+      if (!settled) fail(Object.assign(new Error(e?.type || 'error'), { type: e?.type }));
+      else if (e?.type === 'peer-unavailable') lost();
+    });
+    peer.on('disconnected', () => {
+      if (settled) lost();
+      else fail(new Error('disconnected'));
+    });
+    peer.socket?.on?.('message', (m) => {
+      if (!m || m.type !== SIG_TYPE || m.src !== hostId || !m.payload || typeof m.payload.pgg !== 'string') return;
+      const p = m.payload;
+      rq = rq
+        .then(async () => {
+          if (p.pgg === 'k' && typeof p.pk === 'string' && typeof p.sid === 'string') {
+            if (ch) {
+              if (p.sid !== session.sid) lost();
+              return;
+            }
+            if (session?.sid === p.sid) return;
+            const kp = await genKeys();
+            session = { sid: p.sid, key: await deriveKey(kp.privateKey, p.pk, `${p.sid}:${peer.id}`) };
+            send({ pgg: 'o', pk: await exportPub(kp), sid: p.sid, ...(await seal(session.key, { t: '_open' })) });
+            return;
+          }
+          if (p.pgg === 'rekey') {
+            lost();
+            return;
+          }
+          if (p.pgg !== 'm' || !session || typeof p.iv !== 'string') return;
+          let msg;
+          try {
+            msg = await unseal(session.key, p);
+          } catch {
+            return;
+          }
+          if (!msg || typeof msg !== 'object') return;
+          if (!ch) {
+            if (msg.t === '_opened' && !settled) {
+              settled = true;
+              clearTimeout(timer);
+              clearInterval(probeTimer);
+              ch = makeChannel();
+              resolve(ch);
+            }
+            return;
+          }
+          if (msg.t === '_bye') lost();
+          else if (msg.t !== '_opened') ch.onmessage?.(msg);
+        })
+        .catch(() => {});
+    });
+
+    function makeChannel() {
+      let q = Promise.resolve();
+      const c = {
+        kind: 'sig',
+        closed: false,
+        onmessage: null,
+        onclose: null,
+        send(msg) {
+          if (c.closed || peer.disconnected || peer.destroyed) return false;
+          q = q.then(async () => send({ pgg: 'm', ...(await seal(session.key, msg)) })).catch(() => {});
+          return true;
+        },
+        close() {
+          if (c.closed) return;
+          c.send({ t: '_bye' });
+          c.closed = true;
+          q.finally(() =>
+            setTimeout(() => {
+              try {
+                peer.destroy();
+              } catch {
+                /* ignore */
+              }
+            }, 300),
+          );
+        },
+      };
+      return c;
+    }
   });
 }

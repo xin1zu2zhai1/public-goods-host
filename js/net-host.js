@@ -41,6 +41,7 @@ export class HostNet {
     this._status('connecting');
     const peer = new Peer(this.opts.peerId, { debug: 1, ...this.opts.peerOptions });
     this.peer = peer;
+    this.opts.onPeer?.(peer); // PeerJS 中継（relay.js の SignalHost）がサーバーからのメッセージを受け取れるようにする
 
     peer.on('open', () => {
       this.idTakenCount = 0;

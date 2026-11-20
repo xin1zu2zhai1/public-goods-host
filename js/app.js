@@ -1,9 +1,9 @@
-import * as G from './game.js?v=1.3.0';
-import { HostNet } from './net-host.js?v=1.3.0';
-import { RelayHost } from './relay.js?v=1.3.0';
-import { PEER_ID_PREFIX, DEFAULT_PLAYER_URL, peerOptionsFromParam, relayBrokersFromParam, makeRoomCode } from './config.js?v=1.3.0';
-import { lineChart, legend } from './chart.js?v=1.3.0';
-import { h, replace, yen, pct, downloadText } from './dom.js?v=1.3.0';
+import * as G from './game.js?v=1.4.0';
+import { HostNet } from './net-host.js?v=1.4.0';
+import { RelayHost, SignalHost } from './relay.js?v=1.4.0';
+import { PEER_ID_PREFIX, DEFAULT_PLAYER_URL, peerOptionsFromParam, relayBrokersFromParam, makeRoomCode } from './config.js?v=1.4.0';
+import { lineChart, legend } from './chart.js?v=1.4.0';
+import { h, replace, yen, pct, downloadText } from './dom.js?v=1.4.0';
 
 /* global qrcode */
 
@@ -20,7 +20,8 @@ const $ = (id) => document.getElementById(id);
 
 let state = null;
 let net = null; // 直接（WebRTC / PeerJS）
-let relay = null; // 中継（MQTT・暗号化）
+let relay = null; // MQTT 中継（暗号化）
+let sig = null; // PeerJS 中継（暗号化）
 let relayStatus = { connected: 0, total: 0 };
 let netStartedAt = 0;
 const conns = new Map(); // pid -> conn
@@ -168,13 +169,16 @@ function sendTo(conn, msg) {
 function startNet() {
   net?.destroy();
   relay?.destroy();
+  sig?.destroy();
   conns.clear();
   connPid.clear();
   lastSent.clear();
+  sig = new SignalHost({ onMessage, onClose });
   net = new HostNet({
     peerId: PEER_ID_PREFIX + state.roomCode,
     peerOptions,
     onStatus: onNetStatus,
+    onPeer: (peer) => sig.attach(peer),
     onMessage,
     onClose,
   });
@@ -204,11 +208,11 @@ function renderNetStatus() {
   const ready = netReady();
   el.dataset.s = ready ? 'online' : netStatus === 'error' || netStatus === 'id-taken' ? 'error' : 'connecting';
   const direct = netStatus === 'online' ? '○' : netStatus === 'connecting' || netStatus === 'reconnecting' ? '…' : '×';
-  const rel = relayStatus.total ? `中継 ${relayStatus.connected}/${relayStatus.total}` : '中継なし';
-  el.textContent = `${ready ? '接続OK' : '接続の準備中…'}（直接${direct}・${rel}）`;
-  el.title = '直接＝ブラウザ同士の直接通信（WebRTC）／中継＝暗号化して中継サーバー（MQTT）経由で通信。どちらか一方がつながっていれば参加できます。';
+  const rel = relayStatus.total ? `MQTT ${relayStatus.connected}/${relayStatus.total}` : 'MQTTなし';
+  el.textContent = `${ready ? '接続OK' : '接続の準備中…'}（PeerJS${direct}・${rel}）`;
+  el.title = 'PeerJS＝直接通信とPeerJS中継（どちらも PeerJS のサーバーを使う）／MQTT＝MQTT中継サーバー。どれか1つがつながっていれば参加できます。';
   const brokers = relayStatus.brokers ?? [];
-  $('netDetail').textContent = `通信の状態：直接 ${direct}${brokers.length ? ` ・ 中継 ${brokers.map((b) => `${b.label}${b.connected ? '○' : '×'}`).join(' ')}` : ''}`;
+  $('netDetail').textContent = `通信の状態：PeerJS（直接・中継）${direct}${brokers.length ? ` ・ MQTT中継 ${brokers.map((b) => `${b.label}${b.connected ? '○' : '×'}`).join(' ')}` : ''}`;
   renderAlerts();
 }
 
@@ -507,7 +511,7 @@ function renderJoin() {
   $('playerCount').textContent = String(n);
   $('playerCountBig').textContent = String(n);
   const online = G.activePlayers(state).filter((p) => conns.has(p.pid));
-  const viaRelay = online.filter((p) => conns.get(p.pid)?.kind === 'relay').length;
+  const viaRelay = online.filter((p) => ['relay', 'sig'].includes(conns.get(p.pid)?.kind)).length;
   $('onlineCount').textContent = n
     ? `接続中 ${online.length}人${viaRelay ? `（うち中継 ${viaRelay}人）` : ''}${state.settings.acceptJoin ? '' : '・新規の参加は締め切り中'}`
     : state.settings.acceptJoin
@@ -1109,7 +1113,10 @@ function bindEvents() {
     }
   });
   // ページを離れるときは中継サーバー上の「ルームあり」の印を消す
-  window.addEventListener('pagehide', () => relay?.destroy());
+  window.addEventListener('pagehide', () => {
+    relay?.destroy();
+    sig?.destroy();
+  });
   window.addEventListener('beforeunload', (e) => {
     if (conns.size > 0) {
       e.preventDefault();
